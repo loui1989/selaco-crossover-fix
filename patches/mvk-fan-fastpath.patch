@@ -1,0 +1,109 @@
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h
+index ad371c3..0653506 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h
+@@ -99,6 +99,7 @@ public:
+ 
+     void encode(MVKCommandEncoder* cmdEncoder) override;
+ 	void encodeIndexedIndirect(MVKCommandEncoder* cmdEncoder);
++	void encodeTriangleFanDirect(MVKCommandEncoder* cmdEncoder);
+ 
+ protected:
+ 	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+index 664276b..b68c273 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+@@ -169,6 +169,75 @@ void MVKCmdDraw::encodeIndexedIndirect(MVKCommandEncoder* cmdEncoder) {
+ 	diiCmd.encode(cmdEncoder, ibb);
+ }
+ 
++// Draws a non-tessellated triangle fan as an indexed triangle list whose indexes are written CPU-side.
++// The indexed indirect path sizes its index buffer for the largest possible draw and runs a compute
++// pass that restarts the Metal render pass, on every draw. Engines that draw many small fans,
++// such as GZDoom walls, become GPU-bound on that overhead alone.
++void MVKCmdDraw::encodeTriangleFanDirect(MVKCommandEncoder* cmdEncoder) {
++
++	if (_vertexCount < 3) { return; }	// No complete triangle to draw.
++
++	auto* pipeline = cmdEncoder->getGraphicsPipeline();
++	auto& mtlFeats = cmdEncoder->getMetalFeatures();
++
++	// Fan triangle t is (v[t+1], v[t+2], v[0]), which keeps the Vulkan provoking vertex first,
++	// matching the order MoltenVK's own fan conversion shader produces.
++	uint32_t triCount = _vertexCount - 2;
++	uint32_t idxCount = triCount * 3;
++	auto* idxBuff = cmdEncoder->getTempMTLBuffer(idxCount * sizeof(uint32_t));
++	auto* pIdx = (uint32_t*)idxBuff->getContents();
++	for (uint32_t t = 0; t < triCount; t++) {
++		pIdx[(t * 3) + 0] = _firstVertex + t + 1;
++		pIdx[(t * 3) + 1] = _firstVertex + t + 2;
++		pIdx[(t * 3) + 2] = _firstVertex;
++	}
++
++	cmdEncoder->_isIndexedDraw = true;
++
++	const MVKMTLBufferAllocation* tempDrawIDBuff = nullptr;
++	if (pipeline->needsDrawIdBuffer()) {
++		tempDrawIDBuff = cmdEncoder->getTempMTLBuffer(sizeof(uint32_t));
++		*(uint32_t*)tempDrawIDBuff->getContents() = 0;	// Non-indirect draws are a single draw.
++	}
++
++	MVKPiplineStages stages;
++	pipeline->getStages(stages);
++	for (uint32_t s : stages) {
++		auto stage = MVKGraphicsStage(s);
++		cmdEncoder->finalizeDrawState(stage);	// Ensure all updated state has been submitted to Metal
++
++		if ( !pipeline->hasValidMTLPipelineStates() ) { return; }	// Abort if this pipeline stage could not be compiled.
++		if (stage != kMVKGraphicsStageRasterization) { continue; }
++
++		MVKRenderSubpass* subpass = cmdEncoder->getSubpass();
++		uint32_t viewCount = subpass->isMultiview() ? subpass->getViewCountInMetalPass(cmdEncoder->getMultiviewPassIndex()) : 1;
++		uint32_t instanceCount = _instanceCount * viewCount;
++		cmdEncoder->getState().offsetZeroDivisorVertexBuffers(*cmdEncoder, stage, pipeline, _firstInstance);
++		if (tempDrawIDBuff) {
++			[cmdEncoder->_mtlRenderEncoder setVertexBuffer: tempDrawIDBuff->_mtlBuffer
++													offset: tempDrawIDBuff->_offset
++												   atIndex: pipeline->getImplicitBuffers(kMVKShaderStageVertex).ids[MVKImplicitBuffer::DrawId]];
++		}
++		if (mtlFeats.baseVertexInstanceDrawing) {
++			[cmdEncoder->_mtlRenderEncoder drawIndexedPrimitives: MTLPrimitiveTypeTriangle
++													  indexCount: idxCount
++													   indexType: MTLIndexTypeUInt32
++													 indexBuffer: idxBuff->_mtlBuffer
++											   indexBufferOffset: idxBuff->_offset
++												   instanceCount: instanceCount
++													  baseVertex: 0
++													baseInstance: _firstInstance];
++		} else {
++			[cmdEncoder->_mtlRenderEncoder drawIndexedPrimitives: MTLPrimitiveTypeTriangle
++													  indexCount: idxCount
++													   indexType: MTLIndexTypeUInt32
++													 indexBuffer: idxBuff->_mtlBuffer
++											   indexBufferOffset: idxBuff->_offset
++												   instanceCount: instanceCount];
++		}
++	}
++}
++
+ void MVKCmdDraw::encode(MVKCommandEncoder* cmdEncoder) {
+ 
+ 	if (_vertexCount == 0 || _instanceCount == 0) { return; }	// Nothing to do.
+@@ -179,9 +248,14 @@ void MVKCmdDraw::encode(MVKCommandEncoder* cmdEncoder) {
+ 	auto& mtlFeats = cmdEncoder->getMetalFeatures();
+ 	auto& dvcLimits = cmdEncoder->getDeviceProperties().limits;
+ 
+-	// Metal doesn't support triangle fans, so encode it as triangles via an indexed indirect triangles command instead.
++	// Metal doesn't support triangle fans. Without tessellation, draw the fan as a triangle list built
++	// CPU-side. Otherwise encode it as triangles via an indexed indirect triangles command instead.
+ 	if (pipeline->getVkPrimitiveTopology() == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
+-		encodeIndexedIndirect(cmdEncoder);
++		if (pipeline->isTessellationPipeline()) {
++			encodeIndexedIndirect(cmdEncoder);
++		} else {
++			encodeTriangleFanDirect(cmdEncoder);
++		}
+ 		return;
+ 	}
+ 
